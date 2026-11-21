@@ -112,7 +112,7 @@ Item {
             required property bool hidden
             required property bool favourite
 
-            width: root.cardBaseWidth * root.cardZoom
+            width: cardGrid.cardPixelWidth
             height: styledHeight
 
             elevation: root.cardElevation && dragProxy.dragCard !== cardDelegate

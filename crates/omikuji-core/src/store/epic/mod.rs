@@ -165,13 +165,23 @@ impl EpicStore {
 
         let mut games = Vec::new();
         for entry in arr {
+            // assets/plugins/asset-format/projects/engines are unreal marketplace
+            // content, not installable games; dropped before image resolution so
+            // their art is never fetched either
             if let Some(cats) = entry
                 .pointer("/metadata/categories")
                 .and_then(|c| c.as_array())
                 && cats.iter().any(|c| {
                     c.get("path")
                         .and_then(|p| p.as_str())
-                        .map(|p| p == "assets" || p == "plugins")
+                        .map(|p| {
+                            p == "assets"
+                                || p == "plugins"
+                                || matches!(
+                                    p.split('/').next(),
+                                    Some("asset-format") | Some("projects") | Some("engines")
+                                )
+                        })
                         .unwrap_or(false)
                 })
             {

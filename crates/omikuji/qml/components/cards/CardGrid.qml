@@ -7,8 +7,18 @@ import "../lib/Nav.js" as Nav
 Item {
     id: root
 
-    property alias model: repeater.model
-    property alias count: repeater.count
+    // windowed GridView kicks in only when the consumer supplies modelCount and it
+    // exceeds virtualizeThreshold; consumers on the Flow path are unaffected
+    property var model: null
+    property int modelCount: -1
+    property int virtualizeThreshold: 2147483647
+    // uniform delegate height for the virtual path; 0 derives from cardBaseHeight
+    property real virtualCardHeight: 0
+    readonly property bool virtualized: modelCount >= 0 && modelCount > virtualizeThreshold
+    readonly property int count: root.virtualized ? virtualView.count : repeater.count
+    // delegates must bind their width to this, not 180*zoom: the fractional product
+    // can exceed the flow's rounded column math and push the last column onto a new row
+    readonly property int cardPixelWidth: Math.round(root.cardBaseWidth * root.cardZoom)
     property Component delegate: null
 
     property Component headerComponent: null
@@ -69,12 +79,18 @@ Item {
     }
 
     function itemAt(i) {
-        return repeater.itemAt(i)
+        return root.virtualized ? virtualView.itemAtIndex(i) : repeater.itemAt(i)
     }
 
     function focusIndex(i) {
         keyIndex = i
-        gridFlick.forceActiveFocus()
+        if (root.virtualized) {
+            virtualView.currentIndex = i
+            virtualView.positionViewAtIndex(i, GridView.Contain)
+            virtualView.forceActiveFocus(Qt.TabFocusReason)
+        } else {
+            gridFlick.forceActiveFocus()
+        }
     }
 
     function _visibleIndices() {
@@ -155,6 +171,32 @@ Item {
         flickDeceleration: 3000
         maximumFlickVelocity: 1500
 
+        // wheel interception must sit ABOVE the cards or the flickable's native
+        // wheel handling wins. NoButton keeps clicks pass-through. one card row
+        // per notch, lightly animated, clamped to the content bounds.
+        MouseArea {
+            anchors.fill: parent
+            z: 2
+            acceptedButtons: Qt.NoButton
+            onWheel: (wheel) => {
+                const rowH = root.cardBaseHeight * root.cardZoom + root.cardSpacing
+                const max = Math.max(0, gridFlick.contentHeight - gridFlick.height)
+                const base = wheelAnim.running ? wheelAnim.to : gridFlick.contentY
+                const to = Math.max(0, Math.min(max, base - wheel.angleDelta.y * rowH / 120))
+                wheelAnim.stop()
+                wheelAnim.to = to
+                wheelAnim.start()
+                wheel.accepted = true
+            }
+        }
+        NumberAnimation {
+            id: wheelAnim
+            target: gridFlick
+            property: "contentY"
+            duration: 120
+            easing.type: Theme.ease.standard
+        }
+
         readonly property bool navigable: repeater.count > 0
         function navRectItem() {
             const vis = root._visibleIndices()
@@ -195,7 +237,7 @@ Item {
             z: 1
 
             // width shrinks to exactly N full cards so the last partial row sits left-aligned
-            property int cardW: Math.round(root.cardBaseWidth * root.cardZoom)
+            property int cardW: root.cardPixelWidth
             readonly property int sidePad: 12
             property int avail: Math.max(0, parent.width - sidePad * 2)
             property int maxCols: Math.max(1, Math.floor((avail + root.cardSpacing) / (cardW + root.cardSpacing)))
@@ -217,12 +259,89 @@ Item {
 
             Repeater {
                 id: repeater
+                model: root.virtualized ? null : root.model
                 delegate: root.delegate
                 onItemAdded: (index, item) => {
                     if (item.keyFocused !== undefined)
                         item.keyFocused = Qt.binding(() => InputMode.keyboard && root.navFocused && root.keyIndex === item.index)
                 }
             }
+        }
+    }
+
+    // windowed path for huge libraries: only on-screen cards (+cacheBuffer) exist,
+    // pooled via reuseItems. no per-card filter animation or reorder here — big store
+    // pages filter at the model layer and libraries never cross the threshold.
+    GridView {
+        id: virtualView
+
+        anchors.top: header.active ? header.bottom : parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.topMargin: header.active ? root.headerSpacing : 0
+
+        visible: root.virtualized
+        enabled: root.virtualized
+        clip: true
+        model: root.virtualized ? root.model : null
+        delegate: root.delegate
+
+        reuseItems: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickDeceleration: 3000
+        maximumFlickVelocity: 1500
+
+        // same wheel interception as the flow grid
+        MouseArea {
+            anchors.fill: parent
+            z: 5
+            acceptedButtons: Qt.NoButton
+            onWheel: (wheel) => {
+                const rowH = virtualView.cardH + root.cardSpacing
+                const max = Math.max(0, virtualView.contentHeight - virtualView.height)
+                const base = virtualWheelAnim.running ? virtualWheelAnim.to : virtualView.contentY
+                const to = Math.max(0, Math.min(max, base - wheel.angleDelta.y * rowH / 120))
+                virtualWheelAnim.stop()
+                virtualWheelAnim.to = to
+                virtualWheelAnim.start()
+                wheel.accepted = true
+            }
+        }
+        NumberAnimation {
+            id: virtualWheelAnim
+            target: virtualView
+            property: "contentY"
+            duration: 120
+            easing.type: Theme.ease.standard
+        }
+
+        readonly property int cardW: root.cardPixelWidth
+        readonly property int cardH: root.virtualCardHeight > 0
+            ? Math.round(root.virtualCardHeight)
+            : Math.round(root.cardBaseHeight * root.cardZoom)
+        cellWidth: cardW + root.cardSpacing
+        cellHeight: cardH + root.cardSpacing
+
+        ScrollBar.vertical: ThinScrollBar { padding: 4 }
+
+        // covers the whole scrollable area so clicks on empty grid space fall through
+        MouseArea {
+            anchors.fill: parent
+            z: -1
+            onClicked: {
+                forceActiveFocus()
+                root.backgroundClicked()
+            }
+        }
+
+        Keys.onReturnPressed: (event) => {
+            event.accepted = true
+            root.keyNavActivated(currentIndex)
+        }
+        Keys.onEnterPressed: (event) => {
+            event.accepted = true
+            root.keyNavActivated(currentIndex)
         }
     }
 }

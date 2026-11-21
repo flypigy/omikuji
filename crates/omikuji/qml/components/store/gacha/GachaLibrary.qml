@@ -92,7 +92,7 @@ Item {
             required property var modelData
             required property int index
 
-            width: 180 * root.cardZoom
+            width: cardGrid.cardPixelWidth
             height: styledHeight
             cardStyle: root.cardStyle
             elevation: root.cardElevation

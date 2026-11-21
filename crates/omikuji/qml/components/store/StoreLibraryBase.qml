@@ -24,6 +24,21 @@ Item {
     property string toolName: ""
     property var cardSpotlightKeys: ({})
 
+    // stores whose model implements set_search filter in rust, which lets CardGrid
+    // window the grid instead of instantiating every card; others keep the flow grid
+    readonly property bool modelSearchable: storeModel && storeModel.set_search !== undefined
+    readonly property int virtualizeThreshold: root.modelSearchable ? 120 : 2147483647
+    // store grids always use the 180px base card
+    readonly property int cardPixelWidth: Math.round(180 * root.cardZoom)
+    // the virtual grid needs a uniform cell height; store covers are fixed-ratio art.
+    // derived from cardPixelWidth so it matches styledHeight's width-based math exactly
+    readonly property real uniformCardHeight: {
+        const w = root.cardPixelWidth
+        if (root.cardStyle === "frameless") return Math.round(w * 4 / 3) + 40
+        if (root.cardStyle === "fit") return Math.round(290 * w / 180)
+        return Math.round(240 * w / 180)
+    }
+
     signal backClicked()
     signal gameImported()
     signal installRequested(int index)
@@ -33,14 +48,20 @@ Item {
         if (!storeModel) return
         storeModel.refresh_tools()
         if (storeModel.isLoggedIn) {
+            // rust side ttl-guards this; repeated page visits don't re-run the tool
             storeModel.refresh()
         }
     }
+    function _applySearch() {
+        if (root.modelSearchable) root.storeModel.set_search(root.searchText)
+    }
     Component.onCompleted: {
         _maybeRefresh()
+        _applySearch()
         _syncRows()
     }
     onVisibleChanged: if (visible) _maybeRefresh()
+    onSearchTextChanged: _applySearch()
 
     property int rowCount: 0
     readonly property bool hasRows: rowCount > 0
@@ -49,7 +70,10 @@ Item {
         root.rowCount = root.storeModel ? root.storeModel.rowCount() : 0
     }
 
-    onStoreModelChanged: _syncRows()
+    onStoreModelChanged: {
+        _syncRows()
+        _applySearch()
+    }
 
     Connections {
         target: root.storeModel
@@ -81,7 +105,12 @@ Item {
         id: gridComponent
 
         CardGrid {
+            id: storeGrid
+
             model: root.storeModel
+            modelCount: root.rowCount
+            virtualizeThreshold: root.virtualizeThreshold
+            virtualCardHeight: root.uniformCardHeight
             cardZoom: root.cardZoom
             cardSpacing: root.cardSpacing
             cardFlow: root.cardFlow
@@ -111,7 +140,11 @@ Item {
                     IconButton {
                         icon: "sync"
                         size: 32
-                        onClicked: root.storeModel.refresh()
+                        // models with force_refresh ttl-guard their auto refresh; the
+                        // button always goes back to the source
+                        onClicked: root.storeModel.force_refresh !== undefined
+                            ? root.storeModel.force_refresh()
+                            : root.storeModel.refresh()
                     }
 
                     IconButton {
@@ -127,8 +160,9 @@ Item {
                 required property var modelData
                 required property int index
 
-                width: 180 * root.cardZoom
-                height: styledHeight
+                width: storeGrid.cardPixelWidth
+                // windowed grid needs uniform cells; store covers are fixed-ratio art
+                height: storeGrid.virtualized ? root.uniformCardHeight : styledHeight
                 cardStyle: root.cardStyle
                 elevation: root.cardElevation
 
@@ -145,8 +179,11 @@ Item {
                 leftIconSize: 20
                 selected: isInstalled
                 clickable: false
-                cardVisible: root.searchText === ""
-                    || (modelData.title || "").toLowerCase().includes(root.searchText.toLowerCase())
+                // searchable models filter in rust (windowed grid); the rest filter per-card
+                cardVisible: root.modelSearchable
+                    ? true
+                    : (root.searchText === ""
+                        || (modelData.title || "").toLowerCase().includes(root.searchText.toLowerCase()))
 
                 function primaryAction() {
                     if (isDownloading) return
@@ -217,7 +254,7 @@ Item {
         EmptyState {
             anchors.fill: parent
             icon: root.iconName
-            text: qsTr("No games in this store")
+            text: root.searchText !== "" ? qsTr("No games match your search") : qsTr("No games in this store")
         }
     }
 

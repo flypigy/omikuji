@@ -10,9 +10,14 @@ use omikuji_core::store::epic::{self, EpicStore};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 static EPIC_STORE: LazyLock<Mutex<EpicStore>> = LazyLock::new(|| Mutex::new(EpicStore::new()));
+
+// a full `legendary list` costs tens of seconds on large libraries, so repeat
+// refreshes inside this window reuse the in-memory model instead
+const REFRESH_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -71,6 +76,12 @@ pub mod qobject {
         fn refresh(self: Pin<&mut EpicModel>);
 
         #[qinvokable]
+        fn force_refresh(self: Pin<&mut EpicModel>);
+
+        #[qinvokable]
+        fn set_search(self: Pin<&mut EpicModel>, text: &QString);
+
+        #[qinvokable]
         fn enqueue_install(
             self: Pin<&mut EpicModel>,
             index: i32,
@@ -106,7 +117,11 @@ pub mod qobject {
 }
 
 pub struct EpicModelRust {
+    // `games` is the search-filtered view the ui reads; `all_games` keeps the full
+    // library so filtering never needs another legendary run
     pub games: Vec<StoreGame>,
+    pub all_games: Vec<StoreGame>,
+    pub search: String,
     // app_name -> library game id, drives the three-state card ui and attributes downloads
     pub library_ids: HashMap<String, String>,
     pub is_logged_in: bool,
@@ -114,6 +129,7 @@ pub struct EpicModelRust {
     pub display_name: QString,
     pub tool_ready: bool,
     pub tool_installing: bool,
+    pub last_refresh: Option<Instant>,
 }
 
 impl Default for EpicModelRust {
@@ -126,12 +142,15 @@ impl Default for EpicModelRust {
 
         Self {
             games: Vec::new(),
+            all_games: Vec::new(),
+            search: String::new(),
             library_ids: HashMap::new(),
             is_logged_in,
             is_refreshing: false,
             display_name,
             tool_ready: components::ready(&components::epic_tools()),
             tool_installing: false,
+            last_refresh: None,
         }
     }
 }
@@ -197,7 +216,7 @@ impl qobject::EpicModel {
                     let _ = qt_thread.queue(move |mut obj: Pin<&mut qobject::EpicModel>| {
                         obj.as_mut().set_is_logged_in(true);
                         obj.as_mut().set_display_name(display_name);
-                        obj.as_mut().refresh();
+                        obj.as_mut().force_refresh();
                     });
                 }
                 Err(e) => {
@@ -222,14 +241,32 @@ impl qobject::EpicModel {
                 obj.as_mut().begin_reset_model();
                 let rust = obj.as_mut().rust_mut().get_mut();
                 rust.games.clear();
+                rust.all_games.clear();
+                rust.search.clear();
                 rust.library_ids.clear();
+                rust.last_refresh = None;
                 obj.as_mut().end_reset_model();
             });
         });
     }
 
-    pub fn refresh(mut self: Pin<&mut Self>) {
-        if self.rust().is_refreshing {
+    pub fn refresh(self: Pin<&mut Self>) {
+        self.internal_refresh(false);
+    }
+
+    pub fn force_refresh(self: Pin<&mut Self>) {
+        self.internal_refresh(true);
+    }
+
+    fn internal_refresh(mut self: Pin<&mut Self>, force: bool) {
+        let skip = {
+            let rust = self.rust();
+            rust.is_refreshing
+                || (!force
+                    && rust.last_refresh.is_some_and(|t| t.elapsed() < REFRESH_TTL)
+                    && !rust.all_games.is_empty())
+        };
+        if skip {
             return;
         }
         self.as_mut().set_is_refreshing(true);
@@ -246,12 +283,13 @@ impl qobject::EpicModel {
 
             if !cached.is_empty() {
                 let _ = qt_thread.queue(move |mut obj: Pin<&mut qobject::EpicModel>| {
-                    if !obj.as_ref().games.is_empty() {
+                    if !obj.as_ref().all_games.is_empty() {
                         return;
                     }
                     obj.as_mut().begin_reset_model();
                     let rust = obj.as_mut().rust_mut().get_mut();
-                    rust.games = cached;
+                    rust.all_games = cached;
+                    rust.games = store_model::filtered_games(&rust.all_games, &rust.search);
                     rust.library_ids = ids_pre;
                     obj.as_mut().end_reset_model();
                 });
@@ -271,15 +309,24 @@ impl qobject::EpicModel {
                     .unwrap_or_default();
 
                     let _ = qt_thread.queue(move |mut obj: Pin<&mut qobject::EpicModel>| {
-                        let unchanged =
-                            obj.as_ref().games == games && obj.as_ref().library_ids == ids;
-                        if !unchanged {
-                            obj.as_mut().begin_reset_model();
+                        let search = obj.as_ref().search.clone();
+                        let filtered = store_model::filtered_games(&games, &search);
+                        let unchanged = obj.as_ref().all_games == games
+                            && obj.as_ref().games == filtered
+                            && obj.as_ref().library_ids == ids;
+                        if unchanged {
                             let rust = obj.as_mut().rust_mut().get_mut();
-                            rust.games = games;
-                            rust.library_ids = ids;
-                            obj.as_mut().end_reset_model();
+                            rust.last_refresh = Some(Instant::now());
+                            obj.as_mut().set_is_refreshing(false);
+                            return;
                         }
+                        obj.as_mut().begin_reset_model();
+                        let rust = obj.as_mut().rust_mut().get_mut();
+                        rust.all_games = games;
+                        rust.games = filtered;
+                        rust.library_ids = ids;
+                        rust.last_refresh = Some(Instant::now());
+                        obj.as_mut().end_reset_model();
                         obj.as_mut().set_is_refreshing(false);
                     });
                 }
@@ -291,6 +338,26 @@ impl qobject::EpicModel {
                 }
             }
         });
+    }
+
+    pub fn set_search(mut self: Pin<&mut Self>, text: &QString) {
+        let query = text.to_string().trim().to_lowercase();
+        let filtered = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            if rust.search == query {
+                return;
+            }
+            rust.search = query;
+            store_model::filtered_games(&rust.all_games, &rust.search)
+        };
+        let unchanged = { self.rust().games == filtered };
+        if unchanged {
+            return;
+        }
+        self.as_mut().begin_reset_model();
+        let rust = self.as_mut().rust_mut().get_mut();
+        rust.games = filtered;
+        self.as_mut().end_reset_model();
     }
 
     pub fn enqueue_install(

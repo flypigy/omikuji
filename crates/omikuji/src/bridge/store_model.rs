@@ -74,6 +74,22 @@ pub fn role_data(
     }
 }
 
+// windowed store grids filter here instead of hiding cards in qml, so the view
+// only ever materializes the matches
+pub fn filtered_games(all: &[StoreGame], search: &str) -> Vec<StoreGame> {
+    let query = search.trim().to_lowercase();
+    if query.is_empty() {
+        return all.to_vec();
+    }
+    all.iter()
+        .filter(|g| {
+            g.title.to_lowercase().contains(&query)
+                || g.app_name.to_lowercase().contains(&query)
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn game_map(
     games: &[StoreGame],
     library_ids: &HashMap<String, String>,
