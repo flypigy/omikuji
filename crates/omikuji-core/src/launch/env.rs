@@ -77,6 +77,12 @@ pub fn build_env(
             env.insert("STORE".to_string(), store.to_string());
         }
         env.insert("GAMEID".to_string(), default_game_id(game));
+        // protonfixes pops a zenity dialog for every waitforexitandrun invocation;
+        // companions and tools don't need game fixes, so keep that dialog to the
+        // main game run only instead of firing two or three times per launch
+        if purpose != EnvPurpose::Session {
+            env.insert("PROTONFIXES_DISABLE".to_string(), "1".to_string());
+        }
     }
 
     env.insert(

@@ -88,24 +88,35 @@ pub fn prepare_epic_prefix(
 ) -> Result<()> {
     let prefix = resolve_prefix(game);
 
-    // spoof the epic launcher registry key so games that check for it dont bail early
-    let mut cmd = wine_command(
-        wine_exe,
-        env,
-        WineVariant::from_version(&game.wine.version),
-        Some(ProtonVerb::WaitForExitAndRun),
-        [
-            "reg",
-            "add",
-            "HKEY_CLASSES_ROOT\\com.epicgames.launcher",
-            "/f",
-        ],
-    );
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    // spoof the epic launcher registry key so games that check for it dont bail early.
+    // the key persists in the prefix, but running this costs a full proton cold start
+    // (several seconds), so only do it once per prefix and mark it done
+    let spoof_marker = prefix.join(".omikuji-epic-spoof");
+    if !spoof_marker.exists() {
+        let mut cmd = wine_command(
+            wine_exe,
+            env,
+            WineVariant::from_version(&game.wine.version),
+            Some(ProtonVerb::WaitForExitAndRun),
+            [
+                "reg",
+                "add",
+                "HKEY_CLASSES_ROOT\\com.epicgames.launcher",
+                "/f",
+            ],
+        );
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
 
-    if let Err(e) = cmd.status() {
-        tracing::error!("epic registry spoof failed: {}", e);
+        match cmd.status() {
+            Ok(s) if s.success() => {
+                if let Err(e) = fs_err::write(&spoof_marker, b"") {
+                    tracing::error!("failed to write epic spoof marker: {}", e);
+                }
+            }
+            Ok(s) => tracing::warn!("epic registry spoof exited with: {}", s),
+            Err(e) => tracing::error!("epic registry spoof failed: {}", e),
+        }
     }
 
     let dummy_src = crate::runtime_dir().join("EpicGamesLauncher.exe");
